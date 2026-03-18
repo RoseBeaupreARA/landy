@@ -45,6 +45,16 @@ struct Args {
     #[arg(long, default_value = "0")]
     delay: f32,
 
+    /// Initial heading (deg)
+    #[arg(long)]
+    #[arg(long, default_value = "0")]
+    heading_deg: f32,
+
+    /// Heading rate (deg/s)
+    #[arg(long)]
+    #[arg(long, default_value = "0")]
+    heading_rate_deg: f32,
+
     /// Velocity direction in degrees
     #[arg(long = "vel-degrees")]
     #[arg(long, default_value = "0")]
@@ -124,6 +134,8 @@ struct App {
     init_utc: f64,
     h_noise: f32,
     v_noise: f32,
+    heading_deg: f32,
+    heading_rate_deg: f32,
 }
 
 impl App {
@@ -159,6 +171,13 @@ impl App {
 
         let skymate_utc = get_locked_gnss_time_secs(&telemetry)?;
         let elapsed_secs = skymate_utc - self.init_utc - self.delay as f64;
+        let heading =
+            (self.heading_deg + self.heading_rate_deg * elapsed_secs as f32 + 360.) % 360.;
+        let heading = if heading <= 180. {
+            heading
+        } else {
+            heading - 360.
+        };
         let offset_tangent = self.velocity_ned * elapsed_secs as f32;
         let lla = self.reference.tangent_to_lla(
             offset_tangent
@@ -170,7 +189,7 @@ impl App {
         );
 
         self.skypack
-            .set_precision_landing_zone(lla, self.velocity_ned, skymate_utc)
+            .set_precision_landing_zone(lla, self.velocity_ned, skymate_utc, heading)
             .await?;
         println!(
             "Sent {}, {}, {}",
@@ -250,6 +269,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         init_utc,
         h_noise: args.h_noise,
         v_noise: args.v_noise,
+        heading_deg: args.heading_deg,
+        heading_rate_deg: args.heading_rate_deg,
     };
     app.run().await;
 

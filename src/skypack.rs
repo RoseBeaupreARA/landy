@@ -1,22 +1,23 @@
+use crate::LLA;
+use chrono::Utc;
 use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
+use serde_json;
+use serde_json::json;
+use std::future::Future;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 use tokio::net::UdpSocket;
 use tokio::sync::oneshot;
 use tokio::time::timeout;
-use std::future::Future;
-use chrono::Utc;
-use serde_json;
-use serde_json::json;
-use crate::LLA;
 
 #[derive(Serialize, Debug)]
 struct RequestPacket {
     req: u32,
     id: u64,
+    ct: u32,
     #[serde(skip_serializing_if = "Option::is_none")]
     data: Option<serde_json::Value>,
 }
@@ -73,7 +74,10 @@ impl RequestHandle {
 impl Future for RequestHandle {
     type Output = Result<ResponsePacket, DeviceError>;
 
-    fn poll(mut self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<Self::Output> {
+    fn poll(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Self::Output> {
         use std::task::Poll;
         match std::pin::Pin::new(&mut self.inner).poll(cx) {
             Poll::Ready(Ok(res)) => Poll::Ready(res),
@@ -109,9 +113,12 @@ impl Skypack {
                 match socket.recv_from(&mut buf).await {
                     Ok((size, _src)) => {
                         // Attempt to deserialize generic response to get ID
-                        if let Ok(response) = rmp_serde::from_slice::<ResponsePacket>(&buf[..size]) {
+                        if let Ok(response) = rmp_serde::from_slice::<ResponsePacket>(&buf[..size])
+                        {
                             // If we have a waiter for this ID, send the response and remove from a map
-                            if let Some((_, sender)) = pending_requests.remove(&(response.req, response.id)) {
+                            if let Some((_, sender)) =
+                                pending_requests.remove(&(response.req, response.id))
+                            {
                                 let _ = sender.send(response);
                             }
                         }
@@ -124,11 +131,20 @@ impl Skypack {
 
     /// The core logic handles ID generation, retry loops, and timeouts.
     /// It returns a Future that resolves when the whole process is done.
-    async fn perform_request(&self, req: u32, data: Option<serde_json::Value>) -> Result<ResponsePacket, DeviceError> {
+    async fn perform_request(
+        &self,
+        req: u32,
+        data: Option<serde_json::Value>,
+    ) -> Result<ResponsePacket, DeviceError> {
         // 1. Generate ID (increments automatically)
         let id = self.next_id.fetch_add(1, Ordering::SeqCst);
 
-        let packet = RequestPacket { req, id, data };
+        let packet = RequestPacket {
+            req,
+            id,
+            data,
+            ct: 2,
+        };
         let buf = rmp_serde::to_vec_named(&packet)?;
 
         // Register a listener channel (done once for all retries to avoid race conditions)
@@ -173,9 +189,7 @@ impl Skypack {
     /// Spawns the work on the runtime so it proceeds even if not immediately awaited.
     pub fn get_telemetry(self: &Arc<Self>) -> RequestHandle {
         let self_clone = self.clone();
-        let handle = tokio::spawn(async move {
-            self_clone.perform_request(9, None).await
-        });
+        let handle = tokio::spawn(async move { self_clone.perform_request(9, None).await });
 
         RequestHandle { inner: handle }
     }
@@ -185,26 +199,29 @@ impl Skypack {
     pub fn get_telemetry_sync(self: &Arc<Self>) -> Result<ResponsePacket, DeviceError> {
         // Handle::block_on is the standard way to bridge sync -> async
         tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current().block_on(async {
-                self.perform_request(9, None).await
-            })
+            tokio::runtime::Handle::current()
+                .block_on(async { self.perform_request(9, None).await })
         })
     }
 
-    pub fn set_precision_landing_zone(self: &Arc<Self>, lla: LLA, vel: nalgebra::Vector3<f32>, timestamp: f64) -> RequestHandle {
+    pub fn set_precision_landing_zone(
+        self: &Arc<Self>,
+        lla: LLA,
+        vel: nalgebra::Vector3<f32>,
+        timestamp: f64,
+        heading: f32,
+    ) -> RequestHandle {
         let data = json!({ "items": [{
             "id": 1,
             "frame": "lla".to_owned(),
             "pos": [lla.latitude.to_degrees(), lla.longitude.to_degrees(), lla.altitude],
             "vel":  [vel[0], vel[1], vel[2]],
-            "rpy": [0., 0., 0.],
-            "ts": timestamp
-        }] });
+            "rpy": [0., 0., heading]
+        }],
+            "ts": timestamp });
 
         let self_clone = self.clone();
-        let handle = tokio::spawn(async move {
-            self_clone.perform_request(46, Some(data)).await
-        });
+        let handle = tokio::spawn(async move { self_clone.perform_request(46, Some(data)).await });
 
         RequestHandle { inner: handle }
     }
